@@ -97,21 +97,29 @@
 class Master 
 : public sc_core::sc_module,
 #ifdef USE_GPSOCKET
-  //*** select ***
   public payload_event_queue_output_if<master_atom>
-  //*** select ***
 #else
   public payload_event_queue_output_if<GS_ATOM>
 #endif
 {
 public:
-
-  //*** select ***
+#ifdef USE_GPSOCKET
+# ifdef USE_BLOCKING_API
+  GenericMasterBlockingPort<32> init_port;
+# else
   GenericMasterPort<32> init_port;
-  //*** select ***
+# endif
   typedef GenericMasterPort<32>::accessHandle accessHandle;
   typedef GenericMasterPort<32>::phase phase;
-
+#else
+# ifdef USE_BLOCKING_API
+  GenericMasterBlockingPort init_port;
+# else
+  GenericMasterPort init_port;
+# endif
+  typedef GenericMasterPort::accessHandle accessHandle;
+  typedef GenericMasterPort::phase phase;
+#endif
   typedef pair<accessHandle, phase> peq_pair;
   tlm_utils::peq_with_get<peq_pair> m_receive_peq;
   
@@ -126,7 +134,12 @@ public:
   
   peq_pair* wait_for_next_atom();
 
+#ifdef USE_GPSOCKET
   virtual void notify (master_atom& tc);
+#else
+  virtual void notify (GS_ATOM& tc);
+#endif
+
   virtual void end_of_simulation();
   
   GSDataType mdata;
@@ -153,15 +166,24 @@ public:
   {
     SC_THREAD(main_action);
 
-
+#ifdef USE_BLOCKING_API
+    // bind blocking in interface
+    init_port.out_port(*this);
+#else
     // bind PEQ in interface
     init_port.peq.out_port(*this);
+#endif
     
+#ifdef USE_GPSOCKET
     // Configure the socket
     GSGPSocketConfig cnf;
-
+#  ifdef WRITE_RESPONSE_NEEDED
+    cnf.use_wr_resp = true;
+#  else
     cnf.use_wr_resp = false;
+#  endif
     init_port.set_config(cnf);
+#endif
   }
   
   ~Master(){
@@ -190,6 +212,41 @@ void Master::perform_writes() {
   if (mdata.getSize()<burst_length)
     mdata.getData().resize(burst_length);
   
+
+#ifdef USE_PV
+
+  accessHandle tah = init_port.create_transaction();
+  tah->setMCmd(Generic_MCMD_WR);
+  tah->setMData(mdata);
+  tah->setMBurstLength(burst_length.getValue());
+
+  while(1) {
+    std::cout << std::endl;
+
+    // fill in new write data
+    for (unsigned int i=0; i<burst_length; i++){
+      mdata[i]=data_cnt++;
+    }
+
+#ifdef USE_GPSOCKET
+    addr = init_port.target_addr; addr += (num_loops*burst_length);
+#else
+    addr = init_port.target_addr.value; addr += (num_loops*burst_length);
+#endif
+    tah->setMAddr( addr );
+
+    std::cout << "(" << name() << "): data to send: "; for (unsigned int a = 0; a < burst_length; a++) std::cout << (unsigned int) mdata[a] << " "; std::cout << std::endl;
+    GS_DUMP("Master send blocking.");
+    init_port.Transact(tah);
+
+    if (loops!=0) {
+      num_loops++;
+      if (num_loops==loops) break;
+    }
+  }
+
+#else // if not USE_PV
+
   peq_pair *atom;
   phase ph;
   unsigned bvalid;
@@ -209,18 +266,24 @@ void Master::perform_writes() {
 
     accessHandle tah = init_port.create_transaction();
     tah->setMCmd(Generic_MCMD_WR);
+#ifdef USE_GPSOCKET
     addr = init_port.target_addr; addr += (num_loops*burst_length);
-
+#else
+    addr = init_port.target_addr.value; addr += (num_loops*burst_length);
+#endif
     tah->setMAddr( addr );
     tah->setMData(mdata);
     tah->setMBurstLength(burst_length.getValue());
     
     std::cout << "(" << name() << "): data to send: "; for (unsigned int a = 0; a < burst_length; a++) std::cout << (unsigned int) mdata[a] << " "; std::cout << std::endl;
     GS_DUMP("Master send Request (RequestValid).");
-
+#ifdef USE_BLOCKING_API
+    init_port.Request.block(tah, ph);
+#else
     init_port.Request(tah);
     atom = wait_for_next_atom();
     tah = atom->first; ph = atom->second;
+#endif
 
     if (ph.state == GenericPhase::RequestAccepted) {
       GS_DUMP("Slave sent RequestAccepted.");
@@ -238,15 +301,30 @@ void Master::perform_writes() {
     do {
       // make sure no transaction outstanding
       assert(m_receive_peq.get_next_transaction() == NULL);
-
+# ifdef USE_CC
+      bvalid += 8; // send 64 bit per data atom
+      if (bvalid > burst_length) 
+        bvalid = burst_length;
+# else
       bvalid = burst_length; // send all data with one data atom
+# endif
+#ifdef USE_GPSOCKET // changed because of conceptual bug
       ph.setBytesValid( bvalid );
-
+#else
+      tah->setMSBytesValid(bvalid);
+#endif
       GS_DUMP("Master send data (DataValid).");
-
+#ifdef USE_BLOCKING_API
+# ifdef USE_GPSOCKET
+      init_port.SendData.block(tah, ph);
+# else
+      init_port.SendData.block(tah, ph, ph); // this is different because of a bug in GreenBus
+# endif
+#else
       init_port.SendData(tah,ph);
       atom = wait_for_next_atom();
       tah = atom->first; ph = atom->second;
+#endif
       if (ph.state == GenericPhase::DataAccepted) {
         GS_DUMP("Slave accepted the data (DataAccepted).");
       }
@@ -260,22 +338,43 @@ void Master::perform_writes() {
       }
     } while (bvalid!=burst_length);
 
+#ifdef WRITE_RESPONSE_NEEDED
+    atom = wait_for_next_atom();
+    tah = atom->first; ph = atom->second;
+    if(ph.state == GenericPhase::ResponseValid) {
+      GS_DUMP("Slave sent response (ResponseValid).");
+    }
+    else if (ph.state == GenericPhase::ResponseError){
+      GS_DUMP("Oh no, response error.");
+      return;
+    }
+    else {
+      std::stringstream ss; ss << "wrong phase: "; IF_GPSOCKET( ss << ph.to_string(); )
+      SC_REPORT_ERROR(name(),ss.str().c_str());
+    }
+    init_port.AckResponse(tah,ph);
+#endif
 
-
+# ifdef USE_GPSOCKET
     init_port.release_transaction(tah);
+# endif
     
     if (loops!=0) {
       num_loops++;
       if (num_loops==loops) break;
     }
   }
+#endif // end if USE_PV
 }
 
 // ----------- READ action -----------------------------------------
 void Master::perform_reads() {
   GS_DUMP("read mode");
 
-
+#ifndef USE_PV
+  peq_pair *atom;
+  phase ph;
+#endif
   gs_uint64 addr;
   
   unsigned num_loops = 0;
@@ -291,18 +390,31 @@ void Master::perform_reads() {
       mdata.getData().resize(burst_length);
     
     tah->setMCmd(Generic_MCMD_RD);
+#ifdef USE_GPSOCKET
     addr = init_port.target_addr; addr += (num_loops*burst_length);
-
+#else
+    addr = init_port.target_addr.value; addr += (num_loops*burst_length);
+#endif
     tah->setMAddr( addr );
     tah->setMBurstLength(burst_length.getValue());
     tah->setMData(mdata);
     
-   
-    GS_DUMP("Master send Request (RequestValid).");
+#ifdef USE_PV
 
+    GS_DUMP("Master send blocking.");
+    init_port.Transact(tah);
+    std::cout << "(" << name() << "): data received: "; for (unsigned int a = 0; a < tah->getMBurstLength(); a++) std::cout << (unsigned int) tah->getMData()[a] << " "; std::cout << std::endl;
+
+#else // if not USE_PV
+    
+    GS_DUMP("Master send Request (RequestValid).");
+#ifdef USE_BLOCKING_API
+    init_port.Request.block(tah, ph);
+#else
     init_port.Request(tah);
     atom = wait_for_next_atom();
     tah = atom->first; ph = atom->second;
+#endif
     if (ph.state == GenericPhase::RequestAccepted) {
       GS_DUMP("Slave sent RequestAccepted.");
     }
@@ -321,9 +433,13 @@ void Master::perform_reads() {
       tah = atom->first; ph = atom->second;
       if(ph.state==GenericPhase::ResponseValid){
         GS_DUMP("Slave sent data.");
+#ifdef USE_GPSOCKET
         GS_DUMP("data valid: 0x"<<(std::hex)<< (gs_uint64)ph.getBytesValid() <<(std::dec)
                 <<" (32bit=" << (gs_uint32)ph.getBytesValid() << ")");
-
+#else
+        GS_DUMP("data valid: 0x"<<(std::hex)<< (gs_uint64)tah->getMSBytesValid() <<(std::dec)
+                <<" (32bit=" << (gs_uint32)tah->getMSBytesValid() << ")");
+#endif
       }
       else {
         std::stringstream ss; ss << "wrong phase: "; IF_GPSOCKET( ss << ph.to_string(); )
@@ -331,11 +447,17 @@ void Master::perform_reads() {
       }
       init_port.AckResponse(tah, ph);
     } 
+# ifdef USE_GPSOCKET
     while (ph.getBytesValid() < tah->getMBurstLength());
-
+# else
+    while (tah->getMSBytesValid() < tah->getMBurstLength());
+# endif
     IF_GPSOCKET( std::cout << "(" << name() << "): data received: "; for (unsigned int a = 0; a < tah->getMBurstLength(); a++) std::cout << (unsigned int) tah->getMData()[a] << " "; std::cout << std::endl; )
+#endif // end if USE_PV
     
+# ifdef USE_GPSOCKET
     init_port.release_transaction(tah);
+# endif
     
     if (loops!=0) {
       num_loops++;
@@ -350,8 +472,11 @@ void Master::end_of_simulation() {
 
 
 // ----------- notify -----------------------------------------
+#ifdef USE_GPSOCKET
 void Master::notify(master_atom &tc) {
-
+#else
+void Master::notify(GS_ATOM &tc) {
+#endif
   IF_GPSOCKET( GS_DUMP("non-blocking notify "<< tc.second.to_string()<<", "<< gs::tlm_command_writer::to_string(tc.first.get_tlm_transaction()->get_command())); )
   // legacy code, leave out _getMasterAccessHandle and _getPhase !!
   peq_pair *atom = new peq_pair(_getMasterAccessHandle(tc), _getPhase(tc)); // TODO: Memory Leak, delete after used
@@ -366,9 +491,12 @@ Master::peq_pair* Master::wait_for_next_atom() {
     wait(m_receive_peq.get_event()); // wait for BEGIN_RESP (END_RESP/completed will be sent by nb_transport_bw)
     atom = m_receive_peq.get_next_transaction();
   }
+#ifdef USE_GPSOCKET
   GS_DUMP("got "<< atom->second.to_string()<<" "<<
           gs::tlm_command_writer::to_string(atom->first->get_tlm_transaction()->get_command()) <<
           " out of local peq");
-
+#else
+  GS_DUMP("got " << atom->second.toString() << " out of local peq");
+#endif
   return atom;
 }
